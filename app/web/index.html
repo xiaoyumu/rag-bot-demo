@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG Bot Chat Debug UI</title>
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f5f7fb;
+      color: #1f2937;
+    }
+    .page {
+      max-width: 1080px;
+      margin: 20px auto;
+      padding: 0 16px 20px;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 16px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #dbe3ef;
+      border-radius: 10px;
+      padding: 14px;
+      box-sizing: border-box;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 22px;
+    }
+    h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+    }
+    h3 {
+      margin: 8px 0;
+      font-size: 14px;
+    }
+    .hint {
+      margin: 0 0 10px;
+      color: #5b6472;
+      font-size: 14px;
+    }
+    .stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    input[type="text"] {
+      width: 100%;
+      border: 1px solid #c8d4e3;
+      border-radius: 8px;
+      padding: 10px;
+      box-sizing: border-box;
+      font-size: 14px;
+    }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      background: #2563eb;
+      color: #fff;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:disabled {
+      background: #94a3b8;
+      cursor: not-allowed;
+    }
+    .chat-shell {
+      display: flex;
+      flex-direction: column;
+      min-height: 680px;
+    }
+    .chat-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .badge {
+      font-size: 12px;
+      color: #334155;
+      background: #e2e8f0;
+      border-radius: 999px;
+      padding: 4px 10px;
+    }
+    .messages {
+      flex: 1;
+      border: 1px solid #dbe3ef;
+      border-radius: 10px;
+      padding: 12px;
+      overflow-y: auto;
+      background: #f8fafc;
+      min-height: 420px;
+    }
+    .message {
+      margin-bottom: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .bubble {
+      max-width: 85%;
+      border-radius: 10px;
+      padding: 10px 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .user .bubble {
+      align-self: flex-end;
+      background: #dbeafe;
+      border: 1px solid #bfdbfe;
+    }
+    .assistant .bubble {
+      align-self: flex-start;
+      background: #eef2ff;
+      border: 1px solid #c7d2fe;
+    }
+    .citations {
+      align-self: flex-start;
+      width: 85%;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .citation-item {
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      padding: 8px;
+      background: #ffffff;
+      font-size: 13px;
+    }
+    .citation-meta {
+      font-weight: bold;
+      cursor: pointer;
+      list-style: none;
+    }
+    .citation-meta::-webkit-details-marker {
+      display: none;
+    }
+    .citation-detail {
+      margin-top: 6px;
+      color: #334155;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .citation-snippet {
+      margin-top: 4px;
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 6px 8px;
+    }
+    .rewrite-meta {
+      align-self: flex-start;
+      width: 85%;
+      font-size: 12px;
+      color: #475569;
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
+      border-radius: 8px;
+      padding: 6px 8px;
+    }
+    .chat-input {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+    pre {
+      margin: 0;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 260px;
+      overflow: auto;
+      font-size: 12px;
+    }
+    .doc-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 260px;
+      overflow: auto;
+    }
+    .doc-item {
+      border: 1px solid #dbe3ef;
+      border-radius: 8px;
+      padding: 8px;
+      background: #f8fafc;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .doc-item-title {
+      font-size: 12px;
+      font-weight: bold;
+      color: #1e293b;
+      word-break: break-all;
+    }
+    .doc-item-meta {
+      font-size: 12px;
+      color: #475569;
+    }
+    .doc-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .doc-actions button {
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .collapsed {
+      display: none;
+    }
+    .toast {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.25);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(8px);
+      transition: opacity 0.2s ease, transform 0.2s ease;
+      max-width: 360px;
+      word-break: break-word;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    @media (max-width: 960px) {
+      .page {
+        grid-template-columns: 1fr;
+      }
+      .chat-shell {
+        min-height: 600px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <aside class="stack">
+      <section class="card">
+        <h1>RAG Bot Debug</h1>
+        <p class="hint">Upload docs first, then chat in multiple turns.</p>
+        <div class="row">
+          <span class="badge" id="sessionBadge"></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Ingest Files</h2>
+        <div class="stack">
+          <input id="documentIdInput" type="text" placeholder="Document ID (optional, for update)" />
+          <input id="fileInput" type="file" multiple accept=".pdf,.md,.txt" />
+          <button id="ingestBtn" type="button">Upload to Draft</button>
+          <button id="publishBtn" type="button">Publish Current Document</button>
+          <div class="row">
+            <select id="deleteVersionSelect">
+              <option value="all" selected>delete all versions</option>
+              <option value="draft">delete draft only</option>
+              <option value="publish">delete publish only</option>
+            </select>
+            <button id="deleteDocBtn" type="button">Delete Document</button>
+            <button id="viewDetailBtn" type="button">View Detail</button>
+          </div>
+          <button id="clearAllBtn" type="button">Clear All Knowledge Base</button>
+          <pre id="ingestResult">No ingest result yet.</pre>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Documents</h2>
+        <div class="stack">
+          <div class="row">
+            <button id="refreshDocsBtn" type="button">Refresh</button>
+            <select id="docsVersionFilter">
+              <option value="">all</option>
+              <option value="draft">draft</option>
+              <option value="publish">publish</option>
+            </select>
+            <button id="toggleDocsRawBtn" type="button">Show Raw JSON</button>
+          </div>
+          <div id="docsList" class="doc-list"></div>
+          <pre id="docsResult" class="collapsed">No document list yet.</pre>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Settings</h2>
+        <div class="stack">
+          <label><input id="rewriteToggle" type="checkbox" checked /> Enable rewrite</label>
+          <label><input id="rerankToggle" type="checkbox" checked /> Enable rerank</label>
+          <label>
+            Chat KB Version:
+            <select id="kbVersionSelect">
+              <option value="publish" selected>publish</option>
+              <option value="draft">draft</option>
+            </select>
+          </label>
+        </div>
+      </section>
+    </aside>
+
+    <section class="card chat-shell">
+      <div class="chat-header">
+        <h2>Chat</h2>
+        <button id="newSessionBtn" type="button">New Session</button>
+      </div>
+      <div id="chatMessages" class="messages">
+        <div class="message assistant">
+          <div class="bubble">你好，我可以基于知识库回答问题。</div>
+        </div>
+      </div>
+      <div class="chat-input">
+        <input id="questionInput" type="text" placeholder="Enter your question..." />
+        <button id="chatBtn" type="button">Send</button>
+      </div>
+      <h3>Latest Raw Response</h3>
+      <pre id="chatRawBox">No response yet.</pre>
+    </section>
+  </main>
+  <div id="toast" class="toast"></div>
+  <script src="/web/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+python-multipart
+httpx
+langchain
+langchain-core
+langchain-community
+weaviate-client
+flashrank
+motor
+pytest
+pytest-asyncio
+pypdf
