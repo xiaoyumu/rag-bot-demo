@@ -290,3 +290,12 @@ RAG_RERANK_SCORE_LOG_MAX_ITEMS=3
 - 统一在 `.env.example` 维护默认值和说明。
 - 配置变更采用“单参数逐步调优”，并记录前后指标。
 - 涉及模型更换时，固定一组评测问题做回归对比。
+
+---
+
+## 12. 版本管理实现约束（draft/publish）
+
+- `chunk_id` 采用稳定键策略，包含 `document_id + kb_version + chunk_index + text_hash`，避免跨版本覆盖。
+- `publish` 使用“先清理旧 publish，再写入新 publish，再做数量校验”的流程，确保结果可验证。
+- 若发布失败，错误信息会包含 `stage`（失败阶段）和 `document_id`，可直接用于重试排障。
+- 当前并发保护为单进程内 `document_id` 级互斥（`ingest/publish/delete` 串行化），多实例部署建议升级为分布式锁。

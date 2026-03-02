@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from functools import lru_cache
 import hashlib
@@ -42,6 +43,16 @@ class IngestService:
         self.embedding_client = embedding_client
         self.weaviate_client = weaviate_client
         self.chunk_store = chunk_store
+        self._document_locks: dict[str, asyncio.Lock] = {}
+        self._document_locks_guard = asyncio.Lock()
+
+    async def _get_document_lock(self, document_id: str) -> asyncio.Lock:
+        async with self._document_locks_guard:
+            lock = self._document_locks.get(document_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._document_locks[document_id] = lock
+            return lock
 
     @staticmethod
     def _is_embedding_too_long_error(error: ValueError) -> bool:
@@ -140,8 +151,13 @@ class IngestService:
         return all_chunks, all_vectors
 
     @staticmethod
-    def _stable_chunk_id(document_id: str, index: int, text: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{index}:{text[:64]}"))
+    def _stable_chunk_id(
+        document_id: str,
+        kb_version: str,
+        index: int,
+        text_hash: str,
+    ) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{kb_version}:{index}:{text_hash}"))
 
     def _resolve_embedding_identity(self) -> tuple[str, str]:
         provider = (self.settings.embedding_provider or "ollama").strip().lower() or "ollama"
@@ -221,9 +237,15 @@ class IngestService:
         for index, (chunk, vector, text_hash, embedding_key) in enumerate(
             zip(draft_chunks, vectors, text_hashes, embedding_keys)
         ):
+            chunk_id = self._stable_chunk_id(
+                document_id=chunk.document_id,
+                kb_version="publish",
+                index=index,
+                text_hash=text_hash,
+            )
             records.append(
                 ChunkRecord(
-                    chunk_id=self._stable_chunk_id(chunk.document_id, index, chunk.text),
+                    chunk_id=chunk_id,
                     document_id=chunk.document_id,
                     kb_version="publish",
                     text=chunk.text,
@@ -237,7 +259,7 @@ class IngestService:
             )
             backups.append(
                 ChunkBackupRecord(
-                    chunk_id=self._stable_chunk_id(chunk.document_id, index, chunk.text),
+                    chunk_id=chunk_id,
                     document_id=chunk.document_id,
                     kb_version="publish",
                     text=chunk.text,
@@ -255,25 +277,80 @@ class IngestService:
             )
         return records, backups
 
+    async def _verify_publish_counts(self, document_id: str, expected_count: int) -> tuple[int, int]:
+        weaviate_items = await self.weaviate_client.list_chunks_by_document_version(
+            document_id=document_id,
+            kb_version="publish",
+        )
+        mongo_items = await self.chunk_store.list_document_chunks(
+            document_id=document_id,
+            kb_version="publish",
+            limit=max(200, expected_count),
+        )
+        return len(weaviate_items), len(mongo_items)
+
+    @staticmethod
+    def _build_publish_error(document_id: str, stage: str, detail: str) -> ValueError:
+        return ValueError(
+            f"Publish failed. stage={stage}; document_id={document_id}; detail={detail}"
+        )
+
     async def publish_document(self, document_id: str) -> PublishResponse:
         effective_id = document_id.strip()
         if not effective_id:
             raise ValueError("document_id is required.")
+        lock = await self._get_document_lock(effective_id)
+        async with lock:
+            try:
+                draft_chunks = await self.weaviate_client.list_chunks_by_document_version(
+                    document_id=effective_id,
+                    kb_version="draft",
+                )
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                raise self._build_publish_error(effective_id, "load_draft_chunks", str(exc)) from exc
+            if not draft_chunks:
+                raise ValueError("No draft chunks found for document_id.")
 
-        draft_chunks = await self.weaviate_client.list_chunks_by_document_version(
-            document_id=effective_id,
-            kb_version="draft",
-        )
-        if not draft_chunks:
-            raise ValueError("No draft chunks found for document_id.")
+            try:
+                publish_records, backup_records = await self._build_publish_records(draft_chunks)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                raise self._build_publish_error(effective_id, "build_publish_records", str(exc)) from exc
 
-        publish_records, backup_records = await self._build_publish_records(draft_chunks)
+            expected_count = len(publish_records)
+            if expected_count <= 0:
+                raise self._build_publish_error(effective_id, "build_publish_records", "No publish records generated.")
 
-        await self.weaviate_client.delete_chunks_by_document_version(effective_id, "publish")
-        await self.chunk_store.delete_by_document_version(effective_id, "publish")
-        await self.weaviate_client.upsert_chunks(publish_records)
-        await self.chunk_store.upsert_chunks(backup_records)
-        return PublishResponse(document_id=effective_id, chunks_published=len(publish_records))
+            try:
+                await self.weaviate_client.delete_chunks_by_document_version(effective_id, "publish")
+                await self.chunk_store.delete_by_document_version(effective_id, "publish")
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                raise self._build_publish_error(effective_id, "clear_existing_publish", str(exc)) from exc
+
+            try:
+                await self.weaviate_client.upsert_chunks(publish_records)
+                await self.chunk_store.upsert_chunks(backup_records)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                raise self._build_publish_error(effective_id, "write_publish_records", str(exc)) from exc
+
+            try:
+                weaviate_count, mongo_count = await self._verify_publish_counts(
+                    document_id=effective_id,
+                    expected_count=expected_count,
+                )
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                raise self._build_publish_error(effective_id, "verify_publish_counts", str(exc)) from exc
+
+            if weaviate_count != expected_count or mongo_count != expected_count:
+                raise self._build_publish_error(
+                    effective_id,
+                    "verify_publish_counts",
+                    (
+                        f"expected={expected_count}; "
+                        f"weaviate_count={weaviate_count}; mongo_count={mongo_count}"
+                    ),
+                )
+
+            return PublishResponse(document_id=effective_id, chunks_published=expected_count)
 
     async def list_documents(self, kb_version: str | None = None) -> DocumentListResponse:
         summaries = await self.chunk_store.list_documents(kb_version=kb_version)
@@ -325,15 +402,17 @@ class IngestService:
         targets = ["draft", "publish"] if kb_version == "all" else [kb_version]
         weaviate_deleted = 0
         mongo_deleted = 0
-        for target_version in targets:
-            weaviate_deleted += await self.weaviate_client.delete_chunks_by_document_version(
-                effective_id,
-                target_version,
-            )
-            mongo_deleted += await self.chunk_store.delete_by_document_version(
-                effective_id,
-                target_version,
-            )
+        lock = await self._get_document_lock(effective_id)
+        async with lock:
+            for target_version in targets:
+                weaviate_deleted += await self.weaviate_client.delete_chunks_by_document_version(
+                    effective_id,
+                    target_version,
+                )
+                mongo_deleted += await self.chunk_store.delete_by_document_version(
+                    effective_id,
+                    target_version,
+                )
         return DeleteDocumentResponse(
             document_id=effective_id,
             kb_version=kb_version,
@@ -371,76 +450,82 @@ class IngestService:
             filename = upload_file.filename or "unknown"
             doc_hash = hashlib.sha256(raw_bytes).hexdigest()
             effective_document_id = document_id.strip() if document_id else str(uuid.uuid5(uuid.NAMESPACE_URL, doc_hash))
+            lock = await self._get_document_lock(effective_document_id)
+            async with lock:
+                try:
+                    raw_text = load_text_from_bytes(filename=filename, payload=raw_bytes)
+                except UnsupportedFileTypeError as exc:
+                    raise ValueError(str(exc)) from exc
 
-            try:
-                raw_text = load_text_from_bytes(filename=filename, payload=raw_bytes)
-            except UnsupportedFileTypeError as exc:
-                raise ValueError(str(exc)) from exc
+                clean_text = sanitize_text(raw_text)
+                if not clean_text:
+                    raise ValueError(f"No extractable text: {filename}")
 
-            clean_text = sanitize_text(raw_text)
-            if not clean_text:
-                raise ValueError(f"No extractable text: {filename}")
-
-            base_doc = Document(
-                page_content=clean_text,
-                metadata={
-                    "source": filename,
-                    "doc_hash": doc_hash,
-                    "document_id": effective_document_id,
-                },
-            )
-            chunks = split_documents(
-                documents=[base_doc],
-                chunk_size=self.settings.rag_chunk_size,
-                chunk_overlap=self.settings.rag_chunk_overlap,
-            )
-            chunks, vectors = await self._embed_chunks_with_fallback(chunks)
-            embedding_provider, embedding_model = self._resolve_embedding_identity()
-
-            ingested_at = datetime.now(timezone.utc).isoformat()
-            records: list[ChunkRecord] = []
-            backup_records: list[ChunkBackupRecord] = []
-            for index, (chunk_doc, vector) in enumerate(zip(chunks, vectors)):
-                chunk_id = self._stable_chunk_id(effective_document_id, index, chunk_doc.page_content)
-                text_hash = self._text_hash(chunk_doc.page_content)
-                embedding_key = self._embedding_key(embedding_provider, embedding_model, text_hash)
-                records.append(
-                    ChunkRecord(
-                        chunk_id=chunk_id,
-                        document_id=effective_document_id,
-                        kb_version="draft",
-                        text=chunk_doc.page_content,
-                        vector=vector,
-                        source=filename,
-                        doc_hash=doc_hash,
-                        chunk_index=index,
-                        total_chunks=len(chunks),
-                        ingested_at=ingested_at,
-                    )
+                base_doc = Document(
+                    page_content=clean_text,
+                    metadata={
+                        "source": filename,
+                        "doc_hash": doc_hash,
+                        "document_id": effective_document_id,
+                    },
                 )
-                backup_records.append(
-                    ChunkBackupRecord(
-                        chunk_id=chunk_id,
+                chunks = split_documents(
+                    documents=[base_doc],
+                    chunk_size=self.settings.rag_chunk_size,
+                    chunk_overlap=self.settings.rag_chunk_overlap,
+                )
+                chunks, vectors = await self._embed_chunks_with_fallback(chunks)
+                embedding_provider, embedding_model = self._resolve_embedding_identity()
+
+                ingested_at = datetime.now(timezone.utc).isoformat()
+                records: list[ChunkRecord] = []
+                backup_records: list[ChunkBackupRecord] = []
+                for index, (chunk_doc, vector) in enumerate(zip(chunks, vectors)):
+                    text_hash = self._text_hash(chunk_doc.page_content)
+                    chunk_id = self._stable_chunk_id(
                         document_id=effective_document_id,
                         kb_version="draft",
-                        text=chunk_doc.page_content,
-                        source=filename,
-                        doc_hash=doc_hash,
-                        chunk_index=index,
-                        total_chunks=len(chunks),
-                        ingested_at=ingested_at,
-                        embedding_key=embedding_key,
-                        embedding_provider=embedding_provider,
-                        embedding_model=embedding_model,
+                        index=index,
                         text_hash=text_hash,
-                        embedding_dim=len(vector),
                     )
-                )
+                    embedding_key = self._embedding_key(embedding_provider, embedding_model, text_hash)
+                    records.append(
+                        ChunkRecord(
+                            chunk_id=chunk_id,
+                            document_id=effective_document_id,
+                            kb_version="draft",
+                            text=chunk_doc.page_content,
+                            vector=vector,
+                            source=filename,
+                            doc_hash=doc_hash,
+                            chunk_index=index,
+                            total_chunks=len(chunks),
+                            ingested_at=ingested_at,
+                        )
+                    )
+                    backup_records.append(
+                        ChunkBackupRecord(
+                            chunk_id=chunk_id,
+                            document_id=effective_document_id,
+                            kb_version="draft",
+                            text=chunk_doc.page_content,
+                            source=filename,
+                            doc_hash=doc_hash,
+                            chunk_index=index,
+                            total_chunks=len(chunks),
+                            ingested_at=ingested_at,
+                            embedding_key=embedding_key,
+                            embedding_provider=embedding_provider,
+                            embedding_model=embedding_model,
+                            text_hash=text_hash,
+                            embedding_dim=len(vector),
+                        )
+                    )
 
-            await self.weaviate_client.delete_chunks_by_document_version(effective_document_id, "draft")
-            await self.chunk_store.delete_by_document_version(effective_document_id, "draft")
-            await self.weaviate_client.upsert_chunks(records)
-            await self.chunk_store.upsert_chunks(backup_records)
+                await self.weaviate_client.delete_chunks_by_document_version(effective_document_id, "draft")
+                await self.chunk_store.delete_by_document_version(effective_document_id, "draft")
+                await self.weaviate_client.upsert_chunks(records)
+                await self.chunk_store.upsert_chunks(backup_records)
 
             results.append(
                 IngestFileResult(

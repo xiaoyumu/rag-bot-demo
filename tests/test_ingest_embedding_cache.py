@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 import hashlib
 from types import SimpleNamespace
@@ -38,19 +39,38 @@ class StubEmbeddingClient:
 @dataclass
 class StubWeaviateClient:
     draft_chunks: list[RetrievedChunk] = field(default_factory=list)
+    publish_chunks: list[RetrievedChunk] = field(default_factory=list)
     deleted_calls: list[tuple[str, str]] = field(default_factory=list)
     upserted_chunks: list[ChunkRecord] = field(default_factory=list)
+    fail_on_upsert: bool = False
 
     async def list_chunks_by_document_version(self, document_id: str, kb_version: str) -> list[RetrievedChunk]:
-        _ = document_id, kb_version
-        return self.draft_chunks
+        _ = document_id
+        if kb_version == "draft":
+            return self.draft_chunks
+        return self.publish_chunks
 
     async def delete_chunks_by_document_version(self, document_id: str, kb_version: str) -> int:
         self.deleted_calls.append((document_id, kb_version))
         return 1
 
     async def upsert_chunks(self, chunks: list[ChunkRecord]) -> None:
+        if self.fail_on_upsert:
+            raise RuntimeError("weaviate upsert failed")
         self.upserted_chunks = chunks
+        self.publish_chunks = [
+            RetrievedChunk(
+                chunk_id=item.chunk_id,
+                document_id=item.document_id,
+                kb_version=item.kb_version,
+                text=item.text,
+                source=item.source,
+                doc_hash=item.doc_hash,
+                chunk_index=item.chunk_index,
+                total_chunks=item.total_chunks,
+            )
+            for item in chunks
+        ]
 
 
 @dataclass
@@ -59,6 +79,7 @@ class StubChunkStore:
     upserted_embeddings: list[EmbeddingCacheRecord] = field(default_factory=list)
     upserted_chunks: list[ChunkBackupRecord] = field(default_factory=list)
     deleted_calls: list[tuple[str, str]] = field(default_factory=list)
+    fail_on_upsert_chunks: bool = False
 
     async def list_embeddings_by_text_hashes(
         self,
@@ -79,7 +100,22 @@ class StubChunkStore:
         return 1
 
     async def upsert_chunks(self, chunks: list[ChunkBackupRecord]) -> None:
+        if self.fail_on_upsert_chunks:
+            raise RuntimeError("mongo upsert failed")
         self.upserted_chunks = chunks
+
+    async def list_document_chunks(
+        self,
+        document_id: str,
+        kb_version: str,
+        limit: int = 200,
+    ) -> list[ChunkBackupRecord]:
+        _ = limit
+        return [
+            item
+            for item in self.upserted_chunks
+            if item.document_id == document_id and item.kb_version == kb_version
+        ]
 
 
 def _make_settings() -> SimpleNamespace:
@@ -198,3 +234,81 @@ async def test_publish_document_reuses_cached_embeddings_and_persists_metadata()
     assert all(item.embedding_provider == "ollama" for item in chunk_store.upserted_chunks)
     assert all(item.embedding_model == "nomic-embed-text-v2-moe:latest" for item in chunk_store.upserted_chunks)
     assert all(item.embedding_key for item in chunk_store.upserted_chunks)
+
+
+def test_stable_chunk_id_includes_kb_version() -> None:
+    draft_id = IngestService._stable_chunk_id("doc-1", "draft", 0, "hash-1")
+    publish_id = IngestService._stable_chunk_id("doc-1", "publish", 0, "hash-1")
+    assert draft_id != publish_id
+
+
+@pytest.mark.asyncio
+async def test_publish_document_surfaces_stage_on_write_failure() -> None:
+    embedding_client = StubEmbeddingClient()
+    draft_chunks = [
+        RetrievedChunk(
+            chunk_id="c1",
+            document_id="doc-1",
+            kb_version="draft",
+            text="content",
+            source="demo.md",
+            doc_hash="h1",
+            chunk_index=0,
+            total_chunks=1,
+        )
+    ]
+    weaviate_client = StubWeaviateClient(draft_chunks=draft_chunks, fail_on_upsert=True)
+    chunk_store = StubChunkStore()
+    service = IngestService(_make_settings(), embedding_client, weaviate_client, chunk_store)
+
+    with pytest.raises(ValueError) as exc_info:
+        await service.publish_document("doc-1")
+
+    assert "stage=write_publish_records" in str(exc_info.value)
+    assert "document_id=doc-1" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_publish_document_serializes_same_document_requests() -> None:
+    embedding_client = StubEmbeddingClient()
+    draft_chunks = [
+        RetrievedChunk(
+            chunk_id="c1",
+            document_id="doc-1",
+            kb_version="draft",
+            text="content",
+            source="demo.md",
+            doc_hash="h1",
+            chunk_index=0,
+            total_chunks=1,
+        )
+    ]
+    weaviate_client = StubWeaviateClient(draft_chunks=draft_chunks)
+    chunk_store = StubChunkStore()
+    service = IngestService(_make_settings(), embedding_client, weaviate_client, chunk_store)
+
+    original_builder = service._build_publish_records
+    first_entered = asyncio.Event()
+    release_builder = asyncio.Event()
+    build_concurrency = 0
+    max_concurrency = 0
+
+    async def _slow_builder(chunks: list[RetrievedChunk]):  # type: ignore[no-untyped-def]
+        nonlocal build_concurrency, max_concurrency
+        build_concurrency += 1
+        max_concurrency = max(max_concurrency, build_concurrency)
+        first_entered.set()
+        await release_builder.wait()
+        try:
+            return await original_builder(chunks)
+        finally:
+            build_concurrency -= 1
+
+    service._build_publish_records = _slow_builder  # type: ignore[method-assign]
+    task1 = asyncio.create_task(service.publish_document("doc-1"))
+    await first_entered.wait()
+    task2 = asyncio.create_task(service.publish_document("doc-1"))
+    await asyncio.sleep(0.05)
+    assert max_concurrency == 1
+    release_builder.set()
+    await asyncio.gather(task1, task2)
